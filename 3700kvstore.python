@@ -1,38 +1,115 @@
 #!/usr/bin/env python3
 
-import argparse, socket, time, json, select, struct, sys, math, os
+import argparse, socket, time, json, select, struct, sys, math, os, random, string
 
 BROADCAST = "FFFF"
+ELECTION_TIMEOUT = 0.15
+HEARTBEAT_TIME = 0.05
 
 class Replica:
-    def __init__(self, port, id, others):
-        self.port = port
-        self.id = id
-        self.others = others
+	def __init__(self, port, id, others):
+		self.port = port
+		self.id = id
+		self.others = others
 
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind(('localhost', 0))
+		self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+		self.socket.bind(('localhost', 0))
 
-        print("Replica %s starting up" % self.id, flush=True)
-        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
-        self.send(hello)
-        print("Sent hello message: %s" % hello, flush=True)
+		print("Replica %s starting up" % self.id, flush=True)
+		hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+		self.send(hello)
+		print("Sent hello message: %s" % hello, flush=True)
 
-    def send(self, message):
-        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+	def __get_rand_str__(self, size=16, chars=string.ascii_uppercase + string.digits):
+		return ''.join(random.choice(chars) for _ in range(size))
 
-    def run(self):
-        while True:
-            data, addr = self.socket.recvfrom(65535)
-            msg = data.decode('utf-8')
+	def send(self, message):
+		self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
 
-            print("Received message '%s'" % (msg,), flush=True)
+	def run(self):
+		storage = {}
+		leader_id = BROADCAST
+		type = "follower"
+		term = 0
+		votes = 0
+		voted = False
+		last_heartbeat = 0.0
+		# if self.id == "0000":
+		# 	type = "leader"
+		
+		while True:
+			data, addr = self.socket.recvfrom(65535)
+			msg = data.decode('utf-8')
 
+			print("Received message '%s'" % (msg,), flush=True)
+			msg = json.loads(msg)
+
+			if type == "follower":
+				# if received message from leader, update last time replica heard from leader
+				if msg["type"] == "heartbeat":
+					last_heartbeat = time.monotonic()
+					leader_id = msg["src"]
+				# if not heard from leader in time period, change type to candidate and ask for votes
+				if time.monotonic() - last_heartbeat > ELECTION_TIMEOUT or leader_id == "FFFF":
+					type = "candidate"
+					term = term + 1
+					votes = 1
+					for other_id in self.others:
+						self.send({"src": self.id, "dst": other_id, "leader": leader_id, "type": "vote_req", "MID": msg["MID"]})
+				#if given a vote request and haven't yet voted, vote for that candidate
+				if msg["type"] == "vote_req" and not voted:
+					self.send({"src": self.id, "dst": msg["src"], "leader": leader_id, "type": "vote", "MID": msg["MID"]})
+					voted = True
+				# if given a get or put, redirect to leader
+				if msg["type"] == "get" or msg["type"] == "put":
+					if leader_id == "FFFF":
+						self.send({"src": self.id, "dst": msg["src"], "leader": leader_id, "type": "fail", "MID": msg["MID"]})
+					else:
+						self.send({"src": self.id, "dst": msg["src"], "leader": leader_id, "type": "redirect", "MID": msg["MID"]})
+			elif type == "candidate":
+				# if given a get or put, send fail to get them to retry
+				if msg["type"] == "get" or msg["type"] == "put":
+					self.send({"src": self.id, "dst": msg["src"], "leader": leader_id, "type": "fail", "MID": msg["MID"]})
+				# if given a vote, increment votes
+				if msg["type"] == "vote":
+					votes += 1
+				# if given a heartbeat, go back to being a follower, reset votes, and update leader_id
+				if msg["type"] == "heartbeat":
+					type = "follower"
+					votes = 0
+					leader_id = msg["src"]
+					last_heartbeat = time.monotonic()
+				# if received majority vote, become leader and send out heartbeat
+				if votes > len(self.others) / 2:
+					type = "leader"
+					leader_id = self.id
+					votes = 0
+					for other_id in self.others:
+						self.send({"src": self.id, "dst": other_id, "leader": leader_id, "type": "fail", "MID": msg["MID"]})
+					last_heartbeat = time.monotonic()
+			elif type == "leader":
+				# if given put, store the value
+				if msg["type"] == "put":
+					storage[msg["key"]] = msg["value"]
+					self.send({"src": self.id, "dst": msg["src"], "leader": self.id, "type": "ok", "MID": msg["MID"]})
+				# if given get, send back the asked value
+				elif msg["type"] == "get":
+					if msg["key"] in storage:
+						self.send({"src": self.id, "dst": msg["src"], "leader": self.id, "type": "ok", "MID": msg["MID"], "value": storage[msg["key"]]})
+					else:
+						self.send({"src": self.id, "dst": msg["src"], "leader": self.id, "type": "ok", "MID": msg["MID"], "value": ""})
+				# if last heartbeat was longer than heartbeat time ago, send another
+				if time.monotonic() - last_heartbeat > HEARTBEAT_TIME:
+					for other_id in self.others:
+						self.send({"src": self.id, "dst": other_id, "leader": self.id, "type": "heartbeat", "MID": msg["MID"]})
+					last_heartbeat = time.monotonic()
+				
+				
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='run a key-value store')
-    parser.add_argument('port', type=int, help="Port number to communicate")
-    parser.add_argument('id', type=str, help="ID of this replica")
-    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
-    args = parser.parse_args()
-    replica = Replica(args.port, args.id, args.others)
-    replica.run()
+	parser = argparse.ArgumentParser(description='run a key-value store')
+	parser.add_argument('port', type=int, help="Port number to communicate")
+	parser.add_argument('id', type=str, help="ID of this replica")
+	parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+	args = parser.parse_args()
+	replica = Replica(args.port, args.id, args.others)
+	replica.run()
