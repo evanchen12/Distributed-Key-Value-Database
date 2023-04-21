@@ -3,10 +3,12 @@
 import argparse, socket, time, json, select, struct, sys, math, os, random, string
 
 BROADCAST = "FFFF"
-ELECTION_TIMEOUT = 0.15
+ELECTION_TIMEOUT = 0.3
 HEARTBEAT_TIME = 0.05
 
+
 class Replica:
+
 	def __init__(self, port, id, others):
 		self.port = port
 		self.id = id
@@ -16,100 +18,260 @@ class Replica:
 		self.socket.bind(('localhost', 0))
 
 		print("Replica %s starting up" % self.id, flush=True)
-		hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+		hello = {
+		 "src": self.id,
+		 "dst": BROADCAST,
+		 "leader": BROADCAST,
+		 "type": "hello"
+		}
 		self.send(hello)
 		print("Sent hello message: %s" % hello, flush=True)
 
-	def __get_rand_str__(self, size=16, chars=string.ascii_uppercase + string.digits):
+	def __get_rand_str__(self,
+	                     size=16,
+	                     chars=string.ascii_uppercase + string.digits):
 		return ''.join(random.choice(chars) for _ in range(size))
 
 	def send(self, message):
-		self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+		self.socket.sendto(
+		 json.dumps(message).encode('utf-8'), ('localhost', self.port))
 
 	def run(self):
-		storage = {}
-		leader_id = BROADCAST
-		type = "follower"
-		term = 0
-		votes = 0
-		voted = False
-		last_heartbeat = 0.0
-		# if self.id == "0000":
-		# 	type = "leader"
-		
+		storage = {}  # storage for data for put/get requests
+		leader_id = BROADCAST  # ID of the leader replica
+		type = "follower"  # type of replica, follower | candidate | leader
+		term = 0  # term number
+		votes = 0  # number of votes for this replica to become leader in the current election
+		voted = False  # whether or not this replica has voted in the current election
+		last_heartbeat = 0.0  # time since last heartbeat sent/received
+		commit_index = 0 # highest committed entry
+		uncommit_index = 0 # highest uncommitted entry
+		uncommitted = {} # dictionary with keys and number of ready responses from replicas for leader to determine when to commit and the client/MID of the original put
+		to_delete = []
 		while True:
 			data, addr = self.socket.recvfrom(65535)
 			msg = data.decode('utf-8')
 
-			print("Received message '%s'" % (msg,), flush=True)
+			print("Received message '%s'" % (msg, ), flush=True)
 			msg = json.loads(msg)
 
 			if type == "follower":
 				# if received message from leader, update last time replica heard from leader
 				if msg["type"] == "heartbeat":
+					voted = False
 					last_heartbeat = time.monotonic()
 					leader_id = msg["src"]
+					term = msg["term"]
+					commit_index = msg["commit_index"]
+					for entry in msg["entries"]:
+						# if value was changed
+						if entry["value"] not in storage or entry["value"] != storage[entry["key"]]:
+							# update the value
+							storage[entry["key"]] = entry["value"]
+							# send readied message back to leader
+							self.send({
+							 "src": self.id,
+							 "dst": leader_id,
+							 "leader": leader_id,
+							 "type": "readied",
+							 "MID": msg["MID"],
+							 "key": entry["key"]
+							})
+							# add to uncommitted list
+							uncommitted[entry["key"]] = {"readies": 0, "client": entry["client"], "MID": entry["MID"], "index": entry["index"]}
 				# if not heard from leader in time period, change type to candidate and ask for votes
-				if time.monotonic() - last_heartbeat > ELECTION_TIMEOUT or leader_id == "FFFF":
+				if time.monotonic() - last_heartbeat > ELECTION_TIMEOUT or leader_id == "FFFF" and voted == False:
 					type = "candidate"
 					term = term + 1
 					votes = 1
 					for other_id in self.others:
-						self.send({"src": self.id, "dst": other_id, "leader": leader_id, "type": "vote_req", "MID": msg["MID"]})
+						self.send({
+						 "src": self.id,
+						 "dst": other_id,
+						 "leader": leader_id,
+						 "type": "vote_req",
+						 "MID": msg["MID"],
+						 "term": term
+						})
 				#if given a vote request and haven't yet voted, vote for that candidate
-				if msg["type"] == "vote_req" and not voted:
-					self.send({"src": self.id, "dst": msg["src"], "leader": leader_id, "type": "vote", "MID": msg["MID"]})
+				if msg["type"] == "vote_req" and not voted and msg["term"] >= term:
+					term = msg["term"] 
+					self.send({
+					 "src": self.id,
+					 "dst": msg["src"],
+					 "leader": leader_id,
+					 "type": "vote",
+					 "MID": msg["MID"]
+					})
 					voted = True
 				# if given a get or put, redirect to leader
 				if msg["type"] == "get" or msg["type"] == "put":
 					if leader_id == "FFFF":
-						self.send({"src": self.id, "dst": msg["src"], "leader": leader_id, "type": "fail", "MID": msg["MID"]})
+						self.send({
+						 "src": self.id,
+						 "dst": msg["src"],
+						 "leader": leader_id,
+						 "type": "fail",
+						 "MID": msg["MID"]
+						})
 					else:
-						self.send({"src": self.id, "dst": msg["src"], "leader": leader_id, "type": "redirect", "MID": msg["MID"]})
+						self.send({
+						 "src": self.id,
+						 "dst": msg["src"],
+						 "leader": leader_id,
+						 "type": "redirect",
+						 "MID": msg["MID"]
+						})
+				if msg["type"] == "commit":
+					storage[msg["key"]] = msg["value"]
+					if msg["key"] in uncommitted.keys():
+						del msg["key"]
+
 			elif type == "candidate":
 				# if given a get or put, send fail to get them to retry
 				if msg["type"] == "get" or msg["type"] == "put":
-					self.send({"src": self.id, "dst": msg["src"], "leader": leader_id, "type": "fail", "MID": msg["MID"]})
+					self.send({
+					 "src": self.id,
+					 "dst": msg["src"],
+					 "leader": leader_id,
+					 "type": "fail",
+					 "MID": msg["MID"]
+					})
 				# if given a vote, increment votes
 				if msg["type"] == "vote":
 					votes += 1
 				# if given a heartbeat, go back to being a follower, reset votes, and update leader_id
 				if msg["type"] == "heartbeat":
+					voted = False
 					type = "follower"
 					votes = 0
 					leader_id = msg["src"]
+					term = msg["term"]
+					commit_index = msg["commit_index"]
 					last_heartbeat = time.monotonic()
 				# if received majority vote, become leader and send out heartbeat
 				if votes > len(self.others) / 2:
 					type = "leader"
 					leader_id = self.id
 					votes = 0
+
 					for other_id in self.others:
-						self.send({"src": self.id, "dst": other_id, "leader": leader_id, "type": "fail", "MID": msg["MID"]})
+						self.send({
+						 "src": self.id,
+						 "dst": other_id,
+						 "leader": leader_id,
+						 "type": "heartbeat",
+						 "MID": msg["MID"],
+						 "entries": [],
+						 "term": term,
+						 "commit_index": commit_index
+						})
 					last_heartbeat = time.monotonic()
+
 			elif type == "leader":
 				# if given put, store the value
 				if msg["type"] == "put":
 					storage[msg["key"]] = msg["value"]
-					self.send({"src": self.id, "dst": msg["src"], "leader": self.id, "type": "ok", "MID": msg["MID"]})
+					uncommitted[msg["key"]] = {"readies": 0, "client": msg["src"], "MID": msg["MID"], "index": uncommit_index}
+					uncommit_index += 1
 				# if given get, send back the asked value
 				elif msg["type"] == "get":
-					if msg["key"] in storage:
-						self.send({"src": self.id, "dst": msg["src"], "leader": self.id, "type": "ok", "MID": msg["MID"], "value": storage[msg["key"]]})
+					if msg["key"] in uncommitted:
+						self.send({
+						 "src": self.id,
+						 "dst": msg["src"],
+						 "leader": leader_id,
+						 "type": "fail",
+						 "MID": msg["MID"]
+						})
+					elif msg["key"] in storage:
+						self.send({
+						 "src": self.id,
+						 "dst": msg["src"],
+						 "leader": leader_id,
+						 "type": "ok",
+						 "MID": msg["MID"],
+						 "value": storage[msg["key"]]
+						})
 					else:
-						self.send({"src": self.id, "dst": msg["src"], "leader": self.id, "type": "ok", "MID": msg["MID"], "value": ""})
+						self.send({
+						 "src": self.id,
+						 "dst": msg["src"],
+						 "leader": leader_id,
+						 "type": "ok",
+						 "MID": msg["MID"],
+						 "value": ""
+						})
+				elif msg["type"] == "readied":
+					if msg["key"] in uncommitted.keys():
+						uncommitted[msg["key"]]["readies"] += 1
+						if uncommitted[msg["key"]]["readies"] > len(self.others) / 2:
+							commit_index = uncommitted[msg["key"]]["index"]
+							for key, uncom in uncommitted.items():
+								if commit_index >= uncom["index"]:
+									# send okay back to client
+									self.send({
+									 "src": self.id,
+									 "dst": uncommitted[msg["key"]]["client"],
+									 "leader": leader_id,
+									 "type": "ok",
+									 "MID": uncommitted[msg["key"]]["MID"]
+									})
+									# delete from uncommitted list
+									to_delete.append(msg["key"])
+									# send commit message back to 
+									for other_id in self.others:
+										self.send({
+										 "src": self.id,
+										 "dst": other_id,
+										 "leader": leader_id,
+										 "type": "commit",
+										 "MID": msg["MID"],
+										 "key": msg["key"],
+										 "value": storage[msg["key"]]
+										})
+							for delete in to_delete:
+								if delete in uncommitted:
+									del uncommitted[delete]
+							to_delete = []
+				elif msg["type"] == "heartbeat" and (msg["term"] > term or msg["commit_index"]) > commit_index:
+					type = "follower"
+					commit_index = msg["commit_index"]
+					uncommitted = {}
+					last_heartbeat = time.monotonic()
+					leader_id = msg["src"]
+					term = msg["term"]
+					
+
 				# if last heartbeat was longer than heartbeat time ago, send another
 				if time.monotonic() - last_heartbeat > HEARTBEAT_TIME:
+					entries = []
+					for entry, uncom in uncommitted.items():
+						if (len(entries) < 9):
+							entries.append({"key": entry, "value": storage[entry], "client": uncom["client"], "MID": uncom["MID"], "index": uncom["index"]})
 					for other_id in self.others:
-						self.send({"src": self.id, "dst": other_id, "leader": self.id, "type": "heartbeat", "MID": msg["MID"]})
+						self.send({
+						 "src": self.id,
+						 "dst": other_id,
+						 "leader": leader_id,
+						 "type": "heartbeat",
+						 "MID": msg["MID"],
+						 "entries": entries,
+						 "term": term,
+						 "commit_index": commit_index	
+						})
 					last_heartbeat = time.monotonic()
-				
-				
+
+
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser(description='run a key-value store')
 	parser.add_argument('port', type=int, help="Port number to communicate")
 	parser.add_argument('id', type=str, help="ID of this replica")
-	parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+	parser.add_argument('others',
+	                    metavar='others',
+	                    type=str,
+	                    nargs='+',
+	                    help="IDs of other replicas")
 	args = parser.parse_args()
 	replica = Replica(args.port, args.id, args.others)
 	replica.run()
