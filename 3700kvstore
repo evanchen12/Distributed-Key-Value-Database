@@ -17,7 +17,7 @@ class Replica:
 		self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 		self.socket.bind(('localhost', 0))
 
-		print("Replica %s starting up" % self.id, flush=True)
+		#print("Replica %s starting up" % self.id, flush=True)
 		hello = {
 		 "src": self.id,
 		 "dst": BROADCAST,
@@ -25,7 +25,7 @@ class Replica:
 		 "type": "hello"
 		}
 		self.send(hello)
-		print("Sent hello message: %s" % hello, flush=True)
+		#print("Sent hello message: %s" % hello, flush=True)
 
 	def __get_rand_str__(self,
 	                     size=16,
@@ -52,7 +52,7 @@ class Replica:
 			data, addr = self.socket.recvfrom(65535)
 			msg = data.decode('utf-8')
 
-			print("Received message '%s'" % (msg, ), flush=True)
+			#print("Received message '%s'" % (msg, ), flush=True)
 			msg = json.loads(msg)
 
 			if type == "follower":
