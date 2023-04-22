@@ -264,7 +264,8 @@ class Replica:
 							})
 							to_delete.append(msg)
 				for delete in to_delete:
-					queue.remove(msg)
+					if msg in queue:
+						queue.remove(msg)
 				to_delete = []
 				# if last heartbeat was longer than heartbeat time ago, send another
 				if time.monotonic() - last_heartbeat > HEARTBEAT_TIME:
