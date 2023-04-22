@@ -137,6 +137,9 @@ class Replica:
 					 "type": "fail",
 					 "MID": msg["MID"]
 					})
+				if msg["type"] == "vote_req" and msg["term"] > term:
+					type = "follower"
+					term = msg["term"] 
 				# if given a vote, increment votes
 				if msg["type"] == "vote":
 					votes += 1
