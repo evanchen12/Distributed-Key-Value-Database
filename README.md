@@ -1,11 +1,18 @@
 # Distributed-Key-Value-Database
 # Approach --- 
+Our approach is to have a state variable signalifying the current state of the replica. We have a cases for the 3 possible states: follower, candidate and leader. 
+
+Follower: When follower recieves a heartbeat from leader it update its leader, term and commit index based on what the leader sent it in the heartbeat. It also resets           its election timeout and sets it voted status to false. If there any entries for the follower, it will add it to its storage and uncommitted list and sent a           message to the leader notifying them that it's ready to commit. On top of this, if a commit message is received, it removes that key from its uncommitted               list, committing it. If the election timer runs out, the follower will change its state to candidate, vote for itself, increment its term, and send out vote           requests. If it receives any get or put requests it will sent back a redirect to the leader. If it receives a vote request, it will only give out a vote if             it hasn't voted yet and the candidate's term is the same or greater than itself. It will then proceed to mark itself as voted and will wait for a new leader           to be elected.
+
+Candidate: If it receives an get or put, it will store it in a queue for later. If it receives a vote request, it will check if the sender's term is larger. If it is              larger, it will become a follower and update its term to the sender's. During a election the candidate will receive votes and keep count. The candidate will            become the leader if it receive votes from more than half of the replicas. Then it will send out heartbeat to the other replicas to notify them. If it                  receives a heartbeat at any given point, it will set itself to follower and update to match the leader. 
+
+Leader: If it recieves a put, it will store the message's value to its storage and add it to the list of keys that are uncommitted. If it recieves a get, it will do a         number of things depending on the message's key. If the key is in uncommitted, it will store the message to queue for later and send back the value when the           value is committed. If the key's in the storage, it will send the message with the proper value back. If it's not in the storage, will send an empty value             back. When it receives a readied message this means that a replica is ready to commit for a given key, and if a majority vote is received for a given key, it           will remove that key from its uncommitted list and inform the other replicas that that key has been committed. The leader will become a follower if it                 receives a heartbeat with a greater term or commit index, allowing the sender of the heartbeat to be the sole leader. After dealing with message input, it             looks at its queue and attempts to resolve and put and get requests in its queue that it can. Periodically, the leader will send out heartbeats with data such         as the list of entries to add, the commit index, and the term. 
 
 # Challenges --- 
-- There was a problem with the MID not matching in the initial get. The problem was seemly caused by using if to handle the different state the nodes can be in instead of elif.
-- Key error when iteratting through uncommitted array,
-- Changing between 2 leaders very oftenly,
-# Design and features --- 
-- 
+- There was a problem with the MID not matching in the gets. The problem was seemly caused by using if to handle the different state the nodes can be in instead of elif, causing the code to run twice and send multiple messages back for the same MID.
+- Key error when iteratting through uncommitted array - this issue bugged us multiple times and was usually due to not properly passing data across in the heartbeats.
+- Changing between 2 leaders very often -  we believe this was due to the leaders not properly stepping down when two replicas became leader at the same time. This is some what curbed by having candidate return to follower if a vote request have a higher term.
+- Many get and put requests not being answered - we were unable to fully solve this issue, but attempted to solve it by implementing a queue for unanswerable requests and dealing with them later rather than sending a fail message back.
+
 # Testing --- 
-For testing we use the test file in the configs folder. For looking at more intricate problems we had to use json.dumps since print had no effects
+For testing we use the test file in the configs folder. We were able to stop the program and look at the message history upon failure and attempt to work out what the issue was.
