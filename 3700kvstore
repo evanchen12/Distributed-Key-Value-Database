@@ -48,6 +48,8 @@ class Replica:
 		uncommit_index = 0 # highest uncommitted entry
 		uncommitted = {} # dictionary with keys and number of ready responses from replicas for leader to determine when to commit and the client/MID of the original put
 		to_delete = []
+		queue = []
+		
 		while True:
 			data, addr = self.socket.recvfrom(65535)
 			msg = data.decode('utf-8')
@@ -63,6 +65,7 @@ class Replica:
 					leader_id = msg["src"]
 					term = msg["term"]
 					commit_index = msg["commit_index"]
+					queue = []
 					for entry in msg["entries"]:
 						# if value was changed
 						if entry["value"] not in storage or entry["value"] != storage[entry["key"]]:
@@ -107,13 +110,7 @@ class Replica:
 				# if given a get or put, redirect to leader
 				if msg["type"] == "get" or msg["type"] == "put":
 					if leader_id == "FFFF":
-						self.send({
-						 "src": self.id,
-						 "dst": msg["src"],
-						 "leader": leader_id,
-						 "type": "fail",
-						 "MID": msg["MID"]
-						})
+						queue.append(msg)
 					else:
 						self.send({
 						 "src": self.id,
@@ -128,15 +125,9 @@ class Replica:
 						del msg["key"]
 
 			elif type == "candidate":
-				# if given a get or put, send fail to get them to retry
+				# if given a get or put, add to queue to deal with later
 				if msg["type"] == "get" or msg["type"] == "put":
-					self.send({
-					 "src": self.id,
-					 "dst": msg["src"],
-					 "leader": leader_id,
-					 "type": "fail",
-					 "MID": msg["MID"]
-					})
+					queue.append(msg)
 				if msg["type"] == "vote_req" and msg["term"] > term:
 					type = "follower"
 					term = msg["term"] 
@@ -152,6 +143,7 @@ class Replica:
 					term = msg["term"]
 					commit_index = msg["commit_index"]
 					last_heartbeat = time.monotonic()
+					queue = []
 				# if received majority vote, become leader and send out heartbeat
 				if votes > len(self.others) / 2:
 					type = "leader"
@@ -180,13 +172,7 @@ class Replica:
 				# if given get, send back the asked value
 				elif msg["type"] == "get":
 					if msg["key"] in uncommitted:
-						self.send({
-						 "src": self.id,
-						 "dst": msg["src"],
-						 "leader": leader_id,
-						 "type": "fail",
-						 "MID": msg["MID"]
-						})
+						queue.append(msg)
 					elif msg["key"] in storage:
 						self.send({
 						 "src": self.id,
@@ -244,8 +230,42 @@ class Replica:
 					last_heartbeat = time.monotonic()
 					leader_id = msg["src"]
 					term = msg["term"]
-					
 
+				# handle msg queue
+				for msg in queue:
+					# if given put, store the value
+					if msg["type"] == "put":
+						storage[msg["key"]] = msg["value"]
+						uncommitted[msg["key"]] = {"readies": 0, "client": msg["src"], "MID": msg["MID"], "index": uncommit_index}
+						uncommit_index += 1
+						to_delete.append(msg)
+					# if given get, send back the asked value
+					elif msg["type"] == "get":
+						if msg["key"] in uncommitted:
+							continue
+						elif msg["key"] in storage:
+							self.send({
+							 "src": self.id,
+							 "dst": msg["src"],
+							 "leader": leader_id,
+							 "type": "ok",
+							 "MID": msg["MID"],
+							 "value": storage[msg["key"]]
+							})
+							to_delete.append(msg)
+						else:
+							self.send({
+							 "src": self.id,
+							 "dst": msg["src"],
+							 "leader": leader_id,
+							 "type": "ok",
+							 "MID": msg["MID"],
+							 "value": ""
+							})
+							to_delete.append(msg)
+				for delete in to_delete:
+					queue.remove(msg)
+				to_delete = []
 				# if last heartbeat was longer than heartbeat time ago, send another
 				if time.monotonic() - last_heartbeat > HEARTBEAT_TIME:
 					entries = []
